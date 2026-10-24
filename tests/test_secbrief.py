@@ -174,11 +174,11 @@ class TestDiffAndBaseline(unittest.TestCase):
 class TestAnonymize(unittest.TestCase):
     def test_hosts_ips_paths_are_replaced(self):
         cfg = dict(secbrief.DEFAULT_CONFIG)
-        cfg["deb_hosts"] = [{"name": "spark3", "user": "cyma"}]
-        text = secbrief.anonymize("spark3 192.168.50.214 /Users/cyma/x", cfg, {})
-        self.assertNotIn("spark3", text)
-        self.assertNotIn("192.168.50.214", text)
-        self.assertNotIn("/Users/cyma", text)
+        cfg["deb_hosts"] = [{"name": "myhost", "user": "me"}]
+        text = secbrief.anonymize("myhost 192.0.2.10 /Users/me/x", cfg, {})
+        self.assertNotIn("myhost", text)
+        self.assertNotIn("192.0.2.10", text)
+        self.assertNotIn("/Users/me", text)
 
 
 class TestAptSimAndEcoFix(unittest.TestCase):
