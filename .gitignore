@@ -1,0 +1,6 @@
+config.json
+state/
+cache/
+alerts/
+__pycache__/
+*.pyc
