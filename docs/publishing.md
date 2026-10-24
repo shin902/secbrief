@@ -9,9 +9,9 @@ is a separate, deliberate step.
 # 1. offline tests
 python3 -m unittest tests.test_secbrief
 
-# 2. personal-data scan (must return nothing)
-git grep -nE "([0-9]{1,3}\.){3}[0-9]{1,3}|ts\.net|cyma|macmini|tenhk|masa" -- . \
-  | grep -vE "192\.0\.2\.10"
+# 2. personal-data scan (must return nothing; use YOUR own names/IPs here)
+git grep -nE "([0-9]{1,3}\.){3}[0-9]{1,3}" -- . | grep -vE "192\.0\.2\.10|127\.0\.0\.1|0\.0\.0\.0"
+git grep -inE "<your-username>|<your-hostname>|<your-mail-domain>" -- .
 
 # 3. nothing private tracked
 git status --short          # config.json / state/ / cache/ / alerts/ must stay ignored
