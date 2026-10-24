@@ -1,5 +1,7 @@
 # secbrief
 
+**English** | [한국어](README.ko.md) | [中文](README.zh.md) | [日本語](README.ja.md)
+
 **A daily vulnerability briefing for AI-agent-managed machines.**
 
 You tell an AI agent "watch my machines for vulnerabilities." The agent installs
