@@ -1,0 +1,18 @@
+{
+  "_comment": "Copy to config.json and edit. All paths accept ~. No secrets belong here.",
+  "state_dir": "~/.secbrief/state",
+  "cache_dir": "~/.secbrief/cache",
+  "alert_file": "~/.secbrief/alerts/SECBRIEF-ALERT.md",
+  "output_dir": "~/.secbrief/briefings",
+  "python_envs": [],
+  "_python_envs_comment": "empty = the python running secbrief. Add interpreters to scan other venvs, e.g. [\"/opt/myapp/venv/bin/python\"]",
+  "deb_hosts": [],
+  "_deb_hosts_comment": "Ubuntu/Debian machines reachable by SSH key. e.g. [{\"name\": \"server1\", \"user\": \"me\"}]. Matching runs dpkg on the host; distro advisories (OSV Ubuntu/Debian entries) are the truth for these.",
+  "brew_watch": ["node", "brotli", "curl", "openssl", "git", "openssh", "sqlite", "zlib"],
+  "_brew_watch_comment": "macOS only. Homebrew has no CVE database, so these are reported as version drift (更新遅れ), not CVE findings.",
+  "accepted": [],
+  "_accepted_comment": "Items you reviewed and accept: [{\"advisory_id\": \"OSV-...\", \"package\": \"libfoo\", \"version\": \"1.2.3\"}]. Suppressed from alerts, still shown in the briefing with (accepted). Auto-unaccepted if the CVE enters CISA KEV.",
+  "ignore_overrides": [],
+  "_ignore_overrides_comment": "Owner-asserted 'no input path' for a package+advisory: [{\"advisory_id\": \"...\", \"package\": \"...\"}]. The machine never decides this for you.",
+  "unmonitored_surfaces": ["docker images", "browsers (Chrome/Safari)", "EOL runtimes", "snap/flatpak", "global npm packages"]
+}
