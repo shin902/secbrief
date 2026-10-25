@@ -26,6 +26,24 @@ python3 extras/automation.py cycle --config /absolute/path/operator-config.json
 
 補助カタログと自動版照合の範囲は [PRIMARY-SOURCES.ja.md](PRIMARY-SOURCES.ja.md)。OSパッケージ一覧だけを取得した対象はCVE照合済みとは限らない。
 
+## プロジェクトの自動発見
+
+```sh
+python3 extras/discover_projects.py --root /absolute/path/projects --output discovery.json
+```
+
+探索ルートは明示必須。Java（pom.xml / Gradle）、JS/TS、Python、PHP、Go、Rust、Ruby、.NETの識別ファイルを再帰的に探す。monorepoの子ディレクトリも記録し、同じディレクトリ・言語のmanifestはまとめる。名前による候補発見であり、manifest本文の妥当性や解決済み依存を保証しない。
+
+単発cycleでも自動発見する場合はautomation設定に追加する（相対ルートは設定ファイル位置が基準）。
+
+```json
+"discovery": {"roots": ["/absolute/path/projects"], "exclude": [], "max_depth": 32, "max_entries": 100000}
+```
+
+発見した `package-lock.json` / `composer.lock` は既存パーサーへ自動で渡す。それ以外も `project_discovery` に残すが、Javaの依存解決などは未対応。`dependency_analysis` は発見時点のパーサー対応状況であり、照合の成功状態ではない。実際の解析結果はレポートのassets/errorsと合わせて読む。
+
+node_modules、vendor、.git、仮想環境、一般的なビルド出力・キャッシュは既定除外（除外一覧はcoverageに出力）。これらの配下も調べたい場合はそのディレクトリ自体を別ルートに指定する。シンボリックリンクは辿らない。権限不足・深さ/件数上限はdegraded・終了コード2として扱う。発見だけではコマンド実行・ビルド・外部送信をしない。cycleの既存オンライン許可は別に適用される。
+
 ## 修正は人間の承認後だけ
 
 調査・定期実行は修正権限を持たない。対象、更新argv、cwd、固定環境変数、必要な再起動、事後検証を計画として全体提示する。

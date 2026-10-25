@@ -54,6 +54,13 @@ def load_config(path):
             target=Path(c[key]).expanduser(); c[key]=str(target if target.is_absolute() else base/target)
     for key in ("lockfiles","asar"):
         c[key]=[str(Path(x).expanduser() if Path(x).expanduser().is_absolute() else base/Path(x).expanduser()) for x in c.get(key,[])]
+    if c.get('discovery'):
+        from discover_projects import discover
+        d=c['discovery']
+        if not isinstance(d,dict): raise AutomationError('discovery must be an object')
+        roots=d.get('roots',[])
+        if not isinstance(roots,list) or not all(isinstance(x,str) and x for x in roots): raise AutomationError('discovery.roots must be paths')
+        d['roots']=[str(p if p.is_absolute() else base/p) for p in map(lambda x:Path(x).expanduser(),roots)]
     return c
 
 def run_runner(c):
@@ -83,6 +90,16 @@ def cycle(config_path):
         with (state/"cycle.lock").open("a") as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             sources=None; source_changed=False; signature=None; core_record=None; core_changed=False
+            discovery=None; discovery_changed=False
+            if c.get('discovery'):
+                from discover_projects import discover
+                options=c['discovery']
+                discovery=discover(options.get('roots',[]),options.get('exclude',[]),options.get('max_depth',32),options.get('max_entries',100000))
+                atomic_json(state/'discovery.json',discovery)
+                if discovery['errors']: raise AutomationError('project discovery incomplete; inspect discovery.json')
+                prior=state/'discovery-state.json'
+                discovery_changed=prior.exists() and strict_json(prior)!=discovery['projects']
+                c['lockfiles']=sorted(set(c.get('lockfiles',[])+discovery['scan_inputs']))
             if c.get("core_config"):
                 if not c.get("online"): raise AutomationError("core_config requires online=true because core queries OSV")
                 core_script=Path(c["runner"]).parent.parent/"secbrief.py"
@@ -133,7 +150,14 @@ def cycle(config_path):
             if core_record is not None:
                 report["core"]=core_record; atomic_json(outdir/"report.json",report)
                 atomic_json(state/"core-alert-offset.json",{"offset":core_record["offset"]})
-            status="changed" if code==10 or source_changed or core_changed else "nochange"
+            if discovery is not None:
+                report['project_discovery']=discovery
+                atomic_json(outdir/'report.json',report)
+                with (outdir/'report.md').open('a',encoding='utf-8') as stream:
+                    stream.write('\n## Project discovery\n'+f"Projects: {len(discovery['projects'])}; parser inputs: {len(discovery['scan_inputs'])}. Java/other unsupported manifests remain discovery-only; see report.json.\n")
+                atomic_json(state/'discovery-state.json',discovery['projects'])
+            status="changed" if code==10 or source_changed or core_changed or discovery_changed else "nochange"
+            result['discovery_changed']=bool(discovery_changed)
             result.update(status=status,runner_exit=code,report_status=report.get("status"),change_count=report.get("change_count"),source_changed=source_changed,core_changed=core_changed,report=str(outdir/"report.json"),finished_at=datetime.now(timezone.utc).isoformat())
             print(json.dumps(result,ensure_ascii=False))
             return 0
