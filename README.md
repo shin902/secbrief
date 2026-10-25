@@ -1,5 +1,15 @@
 # secbrief
 
+## About this fork
+
+This is a fork of **[tenhkspark/secbrief](https://github.com/tenhkspark/secbrief)**, retaining its MIT license. Fork additions live on **`feat/secbrief-extra`**, not upstream/main.
+
+- Adds cross-language project discovery (including Java), npm/Composer lockfile scanning, Electron analysis, host/runtime inventory, primary-source/version mapping and human-approved repair execution.
+- Scheduling, notification delivery and exploratory research belong to the calling agent/host (Hermes, OpenClaw, launchd, systemd or cron), not this repository.
+- Discovery is not dependency resolution: Java is discoverable, but Maven/Gradle resolution is not implemented. Universal coverage, unknown-vulnerability detection and unapproved updates are out of scope.
+
+Start with **[fork features, upstream fixes and scope](FORK.md)** and **[agent operations](extras/OPERATIONS.ja.md)**. The original upstream introduction follows; fork-specific behavior and limits are described in those documents.
+
 > Fork additions: [approval-gated operations](extras/OPERATIONS.ja.md), host/runtime inventory, Electron dependencies and primary-source tracking. Scheduling and notification belong to the calling agent/host, not this repository. Remediation requires explicit per-plan approval. Generic apt candidates never prove a CVE fix; truncated scans degrade instead of guessing.
 
 **English** | [한국어](README.ko.md) | [中文](README.zh.md) | [日本語](README.ja.md)

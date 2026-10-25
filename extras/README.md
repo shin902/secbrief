@@ -1,6 +1,6 @@
 # secbrief-extra
 
-A dependency-free Python companion for explicit `npm` v2/v3 and Composer lockfiles, plus static Electron `app.asar` metadata inspection. It does not modify the referenced secbrief project or run advisory-provided commands.
+Part of the [tenhkspark/secbrief fork](../FORK.md). This directory contains one-shot companion tools; scheduling and notification delivery belong to the calling agent or host. Start with [OPERATIONS.ja.md](OPERATIONS.ja.md) for the integrated workflow. This page documents `secbrief_extra.py`, the dependency-free npm/Composer and Electron scanner; it does not execute remediation or advisory-provided commands.
 
 ## Run
 
@@ -24,7 +24,9 @@ An OSV exact-version match is reported as affected. Fix-version strings are advi
 
 ## Limits
 
-No lockfile discovery, package-manager resolution, full OS-level inventory, release-index comparison, auto-remediation, email/webhook delivery, scheduling, or claim of universal vulnerability coverage. Static archive/directory scans are bounded and incomplete; native dependency/version attribution and bundled JS metadata are not authoritative. Inventory errors are surfaced, not interpreted as clean. `fcntl` locking targets Unix-like hosts. No claims are made that this replaces secbrief or fixes its behaviors.
+`secbrief_extra.py` itself does not discover projects or resolve package-manager dependencies. `discover_projects.py` adds bounded discovery for Java, JS/TS, Python, PHP, Go, Rust, Ruby and .NET; `automation.py cycle` passes discovered supported lockfiles to this scanner. Java discovery does not resolve Maven/Gradle dependencies. `inventory_sources.py` adds configured host/runtime/container inventory and source tracking. `automation.py plan/execute` separately supports human-approved remediation; this scanner never performs it. The fork also repairs selected upstream core behaviors; see [FORK.md](../FORK.md).
+
+No email/webhook delivery, scheduler, autonomous repairs or universal vulnerability-coverage guarantee is provided. Static archive/directory scans are bounded and incomplete; native dependency/version attribution and bundled JS candidates are not authoritative. Inventory errors are surfaced, not interpreted as clean. `fcntl` locking targets Unix-like hosts.
 
 ## Tests
 
