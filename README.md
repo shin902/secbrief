@@ -117,6 +117,16 @@ See `SECURITY.md` (what this tool does and deliberately does not do; the
 reporting policy). No secrets belong in `config.json`; `.gitignore` ships with
 `config.json`, `state/`, `cache/`, `alerts/` excluded.
 
+## Contributors
+
+- **tenhkspark** — owner and operator of the DGX Spark cluster
+- **GLM-5.3-Flash** — design, implementation, and this documentation (running locally on the cluster)
+- **Qwen3.8-Flash-Next** — independent security review (running locally on the cluster)
+- **Nemotron 3.5 Lightning 30B-A3B** — independent security review (running locally on the cluster)
+- other local models on the DGX Spark cluster — reviews and verification
+
+All AI contributors ran locally on the owner's hardware; no external AI services were involved.
+
 ## License
 
 MIT. Data is fetched at runtime from public sources (OSV.dev is CC-BY-4.0,

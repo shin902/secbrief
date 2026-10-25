@@ -70,6 +70,16 @@ python3 secbrief.py doctor           # 扫描器还活着吗？上次成功是�
 
 参见`SECURITY.md`（这个工具做什么、刻意不做什么，以及报告政策）。不要把机密放进`config.json`。`.gitignore`从一开始就排除了`config.json`、`state/`、`cache/`、`alerts/`。
 
+## 贡献者
+
+- **tenhkspark** — DGX Spark集群的所有者·运营者
+- **GLM-5.3-Flash** — 设计·实现·本文档（集群上本地运行）
+- **Qwen3.8-Flash-Next** — 独立安全审查（同·本地运行）
+- **Nemotron 3.5 Lightning 30B-A3B** — 独立安全审查（同·本地运行）
+- 其他DGX Spark集群上的本地LLM — 评审与验证
+
+所有AI贡献者均在所有者的硬件上本地运行，未使用任何外部AI服务。
+
 ## 许可证
 
 MIT。数据在运行时从公开来源获取（OSV.dev为CC-BY-4.0，KEV为美国政府公共领域）。secbrief本身不重新分发任何数据。

@@ -70,6 +70,16 @@ python3 secbrief.py doctor           # 스캐너가 살아 있는가? 마지막 
 
 `SECURITY.md`를 참고하세요 (이 도구가 하는 일과 의도적으로 하지 않는 일 · 보고 정책). 비밀정보를 `config.json`에 두지 마세요. `.gitignore`에는 `config.json`, `state/`, `cache/`, `alerts/`가 처음부터 들어 있습니다.
 
+## 기여자
+
+- **tenhkspark** — DGX Spark 클러스터 소유자 · 운영
+- **GLM-5.3-Flash** — 설계 · 구현 · 이 문서 (클러스터에서 로컬 실행)
+- **Qwen3.8-Flash-Next** — 독립 보안 리뷰 (같음 · 로컬 실행)
+- **Nemotron 3.5 Lightning 30B-A3B** — 독립 보안 리뷰 (같음 · 로컬 실행)
+- 기타 DGX Spark 클러스터의 로컬 LLM — 리뷰와 검증
+
+AI 기여자는 모두 소유자의 하드웨어에서 로컬 실행이며, 외부 AI 서비스는 사용하지 않았습니다.
+
 ## 라이선스
 
 MIT. 데이터는 실행 시에 공개 소스에서 취득합니다 (OSV.dev는 CC-BY-4.0, KEV는 미국 정부 퍼블릭 도메인). secbrief 자신은 데이터를 재배포하지 않습니다.

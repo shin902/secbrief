@@ -70,6 +70,16 @@ python3 secbrief.py doctor           # スキャナは生きているか？ 最�
 
 `SECURITY.md`を見ること（このツールが何をし、何を意図的にしないか。報告ポリシー）。秘密情報を`config.json`に置かないこと。`.gitignore`には`config.json`、`state/`、`cache/`、`alerts/`が最初から入っている。
 
+## コントリビューター
+
+- **tenhkspark** — DGX Sparkクラスタのオーナー・運用
+- **GLM-5.3-Flash** — 設計・実装・このドキュメント（クラスタ上でローカル実行）
+- **Qwen3.8-Flash-Next** — 独立セキュリティレビュー（同・ローカル実行）
+- **Nemotron 3.5 Lightning 30B-A3B** — 独立セキュリティレビュー（同・ローカル実行）
+- その他DGX Sparkクラスタ上のローカルLLM — レビューと検証
+
+AIコントリビューターはすべてオーナーのハードウェア上でローカル実行であり、外部AIサービスは不使用。
+
 ## ライセンス
 
 MIT。データは実行時に公開ソースから取得する（OSV.devはCC-BY-4.0、KEVは米国政府パブリックドメイン）。secbrief自身はデータを再配布しない。
