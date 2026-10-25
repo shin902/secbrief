@@ -29,6 +29,55 @@ class ToolkitTests(unittest.TestCase):
             p=Path(d)/"bad.asar"; p.write_bytes(struct.pack("<II",s.MAX_ASAR_HEADER+9,s.MAX_ASAR_HEADER+1))
             with self.assertRaises(s.ScanError): s.inspect_asar(p)
 
+    def make_asar(self, path, files):
+        payload=b""; tree={"files":{}}
+        for loc, data in files.items():
+            node=tree["files"]
+            parts=loc.split("/")
+            for part in parts[:-1]: node=node.setdefault(part,{"files":{}})["files"]
+            node[parts[-1]]={"size":len(data),"offset":str(len(payload))}; payload+=data
+        js=json.dumps(tree,separators=(",",":")).encode(); padded=js+b"\0"*(-len(js)%4)
+        header=struct.pack("<II",4+len(padded),len(js))+padded
+        path.write_bytes(struct.pack("<II",4,len(header))+header+payload)
+
+    def test_asar_scoped_nested_packages_and_osv_assets(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d)/"app.asar"
+            self.make_asar(p,{"app/package.json":b'{"name":"app","version":"1"}',"app/node_modules/@scope/a/package.json":b'{"name":"@scope/a","version":"2.3"}',"app/node_modules/a/node_modules/b/package.json":b'{"name":"b","version":"3"}'})
+            assets=s.inspect_asar(p)["assets"]
+            self.assertEqual({(x["name"],x["version"]) for x in assets},{("app","1"),("@scope/a","2.3"),("b","3")})
+            seen=[]
+            def fake(url,body=None,timeout=30):
+                if url.endswith("querybatch"):
+                    seen.extend(q["package"]["name"] for q in body["queries"]); return {"results":[{} for q in body["queries"]]}
+                raise AssertionError(url)
+            s.osv_scan(assets,fake); self.assertEqual(set(seen),{"app","@scope/a","b"})
+
+    def test_directory_scan_skips_symlink_and_lists_native_candidates(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)/"app.asar.unpacked"; (root/"node_modules/@scope/pkg").mkdir(parents=True)
+            (root/"node_modules/@scope/pkg/package.json").write_text('{"name":"@scope/pkg","version":"1.2"}')
+            (root/"addon.node").write_bytes(b"not a real library")
+            outside=Path(d)/"outside"; outside.mkdir(); (outside/"package.json").write_text('{"name":"bad","version":"9"}')
+            (root/"escape").symlink_to(outside,target_is_directory=True)
+            scan=s.inspect_app_directory(root)
+            self.assertEqual([a["name"] for a in scan["assets"]],["@scope/pkg"])
+            self.assertEqual(scan["native_libraries"][0]["path"],"addon.node")
+
+    def test_runtime_opt_in_fuse_gate_and_observed_versions(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as d:
+            binary=Path(d)/"electron"; binary.write_bytes(b"binary"+s.FUSE_SENTINEL+bytes([1,1])+b"1"+b"end")
+            with patch.object(s.subprocess,"run") as run:
+                self.assertEqual(s.inspect_runtime(binary)["run_as_node_fuse"],"enabled")
+                run.assert_called_once()
+                run.return_value=Mock(returncode=0,stdout='{"electron":"33","node":"20","chrome":"130","v8":"13","brotli":"1","openssl":"3"}')
+                result=s.inspect_runtime(binary)
+                self.assertEqual(result["versions"]["node"]["value"],"20")
+            disabled=Path(d)/"disabled"; disabled.write_bytes(s.FUSE_SENTINEL+bytes([1,1])+b"0")
+            with patch.object(s.subprocess,"run") as run:
+                result=s.inspect_runtime(disabled); run.assert_not_called(); self.assertEqual(result["run_as_node_fuse"],"disabled")
+
     def test_osv_detail_and_failure_are_not_safe(self):
         assets=[{"ecosystem":"npm","name":"pkg","version":"1","source":"lock","location":"node_modules/pkg"}]
         calls=[]
