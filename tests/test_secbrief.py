@@ -175,7 +175,7 @@ class TestAnonymize(unittest.TestCase):
     def test_hosts_ips_paths_are_replaced(self):
         cfg = dict(secbrief.DEFAULT_CONFIG)
         cfg["deb_hosts"] = [{"name": "myhost", "user": "me"}]
-        text = secbrief.anonymize("myhost 192.0.2.10 /Users/me/x", cfg, {})
+        text = secbrief.anonymize("myhost 192.0.2.10 /Users/me/x /home/me/work", cfg, {})
         self.assertNotIn("myhost", text)
         self.assertNotIn("192.0.2.10", text)
         self.assertNotIn("/Users/me", text)
@@ -211,6 +211,196 @@ class TestAptSimAndEcoFix(unittest.TestCase):
     def test_deb_pending_upgrade_is_recommended(self):
         cls = secbrief.classify(True, False, None)
         self.assertEqual(cls, "推奨")
+
+
+class TestCoreRegressions(unittest.TestCase):
+    def setUp(self):
+        self.cfg = dict(secbrief.DEFAULT_CONFIG)
+        self.cfg["detail_sleep"] = 0
+
+    def test_pypi_clean_packages_count_once_including_duplicate_environments(self):
+        inv = {"pypi": [
+            {"name": "clean", "version": "1", "environment": "/py/a"},
+            {"name": "clean", "version": "1", "environment": "/py/b"}],
+            "deb_hosts": {}, "brew": {}, "errors": []}
+        with mock.patch.object(secbrief, "osv_querybatch", return_value=[{}, {}]):
+            _, _, cov = secbrief.match_inventory(inv, self.cfg, set(), lambda *_: None)
+        self.assertEqual(cov["clean_packages"], 2)
+
+    def test_pypi_environment_identity_survives_matching(self):
+        inv = {"pypi": [
+            {"name": "x", "version": "1", "environment": "/env/one"},
+            {"name": "x", "version": "1", "environment": "/env/two"}],
+            "deb_hosts": {}, "brew": {}, "errors": []}
+        detail = fake_detail("GHSA-x", "x", "PyPI", fixed="2")
+        with mock.patch.object(secbrief, "osv_querybatch", return_value=[
+                {"vulns": [{"id": "GHSA-x"}]}, {"vulns": [{"id": "GHSA-x"}]}]):
+            findings, _, _ = secbrief.match_inventory(inv, self.cfg, set(), lambda *_: (detail, True))
+        self.assertEqual({f["host"] for f in findings}, {"/env/one", "/env/two"})
+        self.assertEqual(len({f["fingerprint"] for f in findings}), 2)
+
+    def test_detail_cache_refreshes_after_configured_ttl(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            cfg = dict(self.cfg, cache_dir=td, detail_cache_ttl=10, osv_vuln_url="https://example/")
+            dpath = os.path.join(td, "osv", "GHSA-x.json")
+            os.makedirs(os.path.dirname(dpath))
+            with open(dpath, "w", encoding="utf-8") as f:
+                json.dump({"id": "GHSA-x", "summary": "old"}, f)
+            os.utime(dpath, (1, 1))
+            with mock.patch.object(secbrief, "fetch_json", return_value={"id": "GHSA-x", "summary": "fresh"}) as fetch:
+                detail, cached = secbrief.osv_vuln_detail("GHSA-x", cfg)
+            self.assertEqual(detail["summary"], "fresh")
+            self.assertFalse(cached)
+            fetch.assert_called_once()
+
+    def test_deb_apt_candidate_never_proves_advisory_fix(self):
+        inv = {"pypi": [], "brew": {}, "errors": [], "deb_hosts": {"h": {
+            "release": "24.04", "distro": "ubuntu",
+            "packages": [{"name": "libx", "source": "xsrc", "version": "1.0-1"}],
+            "upgradable": {"libx": "99.0-1"}}}}
+        detail = fake_detail("UBUNTU-CVE-2026-111497", "xsrc", "Ubuntu:22.04:LTS",
+                             fixed="2.0-1", aliases=["CVE-2026-111497"])
+        with mock.patch.object(secbrief, "osv_querybatch", return_value=[{"vulns": [{"id": detail["id"]}]}]):
+            findings, _, _ = secbrief.match_inventory(inv, self.cfg, set(), lambda *_: (detail, True))
+        self.assertEqual(findings[0]["fix"], "判定不能（OSV詳細/source/ecosystem未確認）")
+        self.assertEqual(findings[0]["class"], "観察")
+        self.assertNotIn("apt候補", findings[0]["fix"])
+
+    def test_exact_deb_ecosystem_fixed_version_is_reported(self):
+        inv = {"pypi": [], "brew": {}, "errors": [], "deb_hosts": {"h": {
+            "release": "24.04", "distro": "ubuntu",
+            "packages": [{"name": "libx", "source": "xsrc", "version": "1.0-1"}],
+            "upgradable": {"libx": "99.0-1"}}}}
+        detail = fake_detail("UBUNTU-CVE-2026-111497", "xsrc", "Ubuntu:24.04:LTS",
+                             fixed="2.0-1", aliases=["CVE-2026-111497"])
+        with mock.patch.object(secbrief, "osv_querybatch", return_value=[{"vulns": [{"id": detail["id"]}]}]), \
+             mock.patch.object(secbrief, "deb_version_lt", return_value=True):
+            findings, _, _ = secbrief.match_inventory(inv, self.cfg, set(), lambda *_: (detail, True))
+        self.assertEqual(findings[0]["fix"], "あり(OSV固定版 2.0-1)")
+        self.assertEqual(findings[0]["class"], "推奨")
+
+    def test_detail_cap_allows_fresh_cache_and_counts_only_network_fetches(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            cfg = dict(self.cfg, cache_dir=td, max_detail_fetch=0)
+            os.makedirs(os.path.join(td, "osv"))
+            with open(os.path.join(td, "osv", "GHSA-cache.json"), "w", encoding="utf-8") as f:
+                json.dump({"id": "GHSA-cache", "affected": []}, f)
+            inv = {"pypi": [{"name": "x", "version": "1"}], "deb_hosts": {}, "brew": {}, "errors": []}
+            with mock.patch.object(secbrief, "osv_querybatch", return_value=[{"vulns": [{"id": "GHSA-cache"}]}]):
+                findings, _, cov = secbrief.match_inventory(inv, cfg, set(), secbrief.osv_vuln_detail)
+            self.assertEqual(cov["advisories_fetched"], 0)
+            self.assertEqual(cov["deferred"], 0)
+            self.assertEqual(findings, [])
+
+    def test_paste_pack_anonymizes_linux_home_user_ip_and_host(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            briefing = os.path.join(td, "briefing.md")
+            out = os.path.join(td, "pack.md")
+            with open(briefing, "w", encoding="utf-8") as f:
+                f.write("opsbox alice 192.0.2.8 /home/alice/work")
+            cfg = dict(self.cfg, deb_hosts=[{"name": "opsbox", "user": "alice"}])
+            secbrief.build_paste_pack(briefing, cfg, out)
+            with open(out, encoding="utf-8") as f:
+                pack = f.read()
+            self.assertNotIn("opsbox", pack)
+            self.assertNotIn("alice", pack)
+            self.assertNotIn("192.0.2.8", pack)
+            self.assertNotIn("/home/", pack)
+            self.assertIn("<IP>", pack)
+
+    def test_degraded_runs_do_not_advance_baseline_and_return_two(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            cfg = dict(self.cfg, state_dir=os.path.join(td, "state"),
+                       output_dir=os.path.join(td, "out"), alert_file=os.path.join(td, "alerts.md"))
+            state = {"baseline": False, "fingerprints": {}, "last_full_success": None}
+            secbrief.save_state(cfg, state)
+            inv = {"pypi": [], "brew": {}, "deb_hosts": {}, "errors": []}
+            incomplete = {"queries": 0, "advisories_fetched": 0, "deferred": 1,
+                          "cap_hit": True, "gate_dropped": 0, "clean_packages": 0}
+            with mock.patch.object(secbrief, "build_inventory", return_value=(inv, [])), \
+                 mock.patch.object(secbrief, "kev_set", return_value=(set(), True)), \
+                 mock.patch.object(secbrief, "match_inventory", return_value=([], [], incomplete)), \
+                 mock.patch("builtins.print"):
+                rc = secbrief.cmd_run(cfg)
+            saved = secbrief.load_state(cfg)
+            self.assertEqual(rc, 2)
+            self.assertFalse(saved["baseline"])
+            self.assertIsNone(saved["last_full_success"])
+            with open(cfg["alert_file"], encoding="utf-8") as f:
+                self.assertIn("DEGRADED", f.read())
+            with open(os.path.join(cfg["output_dir"], "briefing.md"), encoding="utf-8") as f:
+                self.assertIn("DEGRADED", f.read())
+
+    def test_osv_querybatch_pagination_fails_closed(self):
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def read(self): return b'{"results":[{"vulns":[]}],"next_page_token":"more"}'
+        cfg = dict(self.cfg, osv_query_url="https://example.invalid", http_timeout=1)
+        with mock.patch.object(secbrief.urllib.request, "urlopen", return_value=Response()), \
+             mock.patch.object(secbrief.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "paginated"):
+                secbrief.osv_querybatch([{"package": {"name": "x"}}], cfg)
+
+    def test_advisory_summary_change_is_visible(self):
+        cfg = dict(self.cfg, accepted=[], ignore_overrides=[])
+        current = {"fingerprint": "fp", "class": "推奨", "fix": "1.2.1", "kev": False,
+                   "package": "brotli", "advisory_id": "GHSA-x", "installed_version": "1.0",
+                   "severity": "HIGH", "summary": "new text"}
+        state = {"baseline": True, "fingerprints": {"fp": {
+            "class": "推奨", "fix": "1.2.1", "kev": False, "installed_version": "1.0",
+            "severity": "HIGH", "summary": "old text"}}}
+        new, changed, _, _ = secbrief.diff_findings([current], state, cfg, set())
+        self.assertEqual(len(new), 1)
+        self.assertEqual(changed, [])
+
+    def test_brew_index_failure_prevents_full_success(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            cfg = dict(self.cfg, state_dir=os.path.join(td, "state"),
+                       output_dir=os.path.join(td, "out"), alert_file=os.path.join(td, "alerts.md"))
+            secbrief.save_state(cfg, {"baseline": True, "fingerprints": {}, "last_full_success": "old"})
+            inv = {"pypi": [], "brew": {}, "deb_hosts": {}, "errors": []}
+            cov = {"queries": 0, "advisories_fetched": 0, "deferred": 0, "cap_hit": False,
+                   "clean_packages": 0, "brew_stale_index": True}
+            with mock.patch.object(secbrief, "build_inventory", return_value=(inv, [])), \
+                 mock.patch.object(secbrief, "kev_set", return_value=(set(), True)), \
+                 mock.patch.object(secbrief, "match_inventory", return_value=([], [], cov)), \
+                 mock.patch("builtins.print"):
+                rc = secbrief.cmd_run(cfg)
+            self.assertEqual(rc, 2)
+            self.assertEqual(secbrief.load_state(cfg)["last_full_success"], "old")
+
+    def test_detail_fetch_failure_is_counted_as_deferred_and_incomplete(self):
+        inv = {"pypi": [{"name": "x", "version": "1"}], "deb_hosts": {},
+               "brew": {}, "errors": []}
+        with mock.patch.object(secbrief, "osv_querybatch", return_value=[{"vulns": [{"id": "GHSA-x"}]}]):
+            findings, _, cov = secbrief.match_inventory(inv, self.cfg, set(),
+                                                        mock.Mock(side_effect=RuntimeError("offline")))
+        self.assertEqual(findings, [])
+        self.assertEqual(cov["fetch_errors"], 1)
+        self.assertEqual(cov["deferred"], 1)
+
+    def test_gate_drops_are_not_full_success(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            cfg = dict(self.cfg, state_dir=os.path.join(td, "state"),
+                       output_dir=os.path.join(td, "out"), alert_file=os.path.join(td, "alerts.md"))
+            secbrief.save_state(cfg, {"baseline": True, "fingerprints": {}, "last_full_success": "old"})
+            inv = {"pypi": [], "brew": {}, "deb_hosts": {}, "errors": []}
+            bad = {"fingerprint": "x", "class": "推奨", "advisory_id": None}
+            cov = {"queries": 0, "advisories_fetched": 0, "deferred": 0, "cap_hit": False, "clean_packages": 0}
+            with mock.patch.object(secbrief, "build_inventory", return_value=(inv, [])), \
+                 mock.patch.object(secbrief, "kev_set", return_value=(set(), True)), \
+                 mock.patch.object(secbrief, "match_inventory", return_value=([bad], [], cov)), \
+                 mock.patch("builtins.print"):
+                rc = secbrief.cmd_run(cfg)
+            self.assertEqual(rc, 2)
+            self.assertEqual(secbrief.load_state(cfg)["last_full_success"], "old")
 
 
 if __name__ == "__main__":

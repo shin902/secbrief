@@ -67,6 +67,7 @@ DEFAULT_CONFIG = {
     "brew_api": "https://formulae.brew.sh/api/formula/{name}.json",
     "http_timeout": 60,
     "max_detail_fetch": 150,              # per run; the rest are deferred to the next run
+    "detail_cache_ttl": 86400,            # refresh advisory details at least daily
     "deb_batch_size": 100,                # querybatch chunk (OSV hard cap is 1000 queries)
     "detail_sleep": 0.1,
     "anonymize_extra": [],                # [[regex, replacement], ...]
@@ -144,7 +145,8 @@ def inv_pip(python):
     if rc != 0:
         raise RuntimeError(f"pip list failed for {python}: {err.strip()[:200]}")
     items = json.loads(out or "[]")
-    return [{"name": i["name"].lower(), "version": i["version"], "ecosystem": "PyPI"}
+    return [{"name": i["name"].lower(), "version": i["version"], "ecosystem": "PyPI",
+             "environment": os.path.realpath(python)}
             for i in items if i.get("name") and i.get("version")]
 
 
@@ -174,8 +176,8 @@ def parse_apt_sim(out):
 def inv_deb_host(host):
     """Return {"release", "distro", "packages", "upgradable"} over ssh.
 
-    `apt-get -s upgrade` is a read-only simulation (writes nothing); its Inst
-    lines are the distro's own answer to "what would fix things here".
+    `apt-get -s upgrade` is collected as context only; it cannot prove an
+    advisory-specific fix.
     """
     user = host.get("user")
     target = f"{user}@{host['name']}" if user else host["name"]
@@ -243,7 +245,11 @@ def osv_querybatch(queries, cfg):
                     headers={"Content-Type": "application/json", "User-Agent": UA})
                 with urllib.request.urlopen(req, timeout=timeout) as r:
                     d = json.loads(r.read().decode())
+                if d.get("next_page_token"):
+                    raise RuntimeError("OSV querybatch response is paginated; refusing incomplete results")
                 res = d.get("results", [])
+                if any(isinstance(item, dict) and item.get("next_page_token") for item in res):
+                    raise RuntimeError("OSV querybatch result is paginated; refusing incomplete results")
                 if len(res) != len(chunk):
                     raise RuntimeError(f"OSV querybatch returned {len(res)} for {len(chunk)} queries")
                 out.extend(res)
@@ -261,14 +267,15 @@ def osv_vuln_detail(vid, cfg, cache=None):
     cache_dir = os.path.join(cfg["cache_dir"], "osv")
     os.makedirs(os.path.expanduser(cache_dir), exist_ok=True)
     cpath = os.path.join(os.path.expanduser(cache_dir), vid.replace("/", "_") + ".json")
-    if os.path.exists(cpath):
-        try:
+    try:
+        cache_fresh = time.time() - os.path.getmtime(cpath) <= cfg.get("detail_cache_ttl", 86400)
+        if cache_fresh:
             with open(cpath, encoding="utf-8") as f:
                 d = json.load(f)
             if d.get("id") == vid:
                 return d, True
-        except (json.JSONDecodeError, OSError):
-            pass  # corrupted cache entry: refetch
+    except (json.JSONDecodeError, OSError):
+        pass  # missing, stale, or corrupted cache entry: refetch
     d = fetch_json(cfg["osv_vuln_url"] + vid, timeout=cfg["http_timeout"])
     with open(cpath, "w", encoding="utf-8") as f:
         json.dump(d, f, ensure_ascii=False)
@@ -312,7 +319,7 @@ def advisory_fix_version(vuln, package, release, expected_eco=None):
         pkg = (aff.get("package") or {})
         pname = pkg.get("name", "")
         eco = pkg.get("ecosystem", "")
-        if pname != package and pname != (package + "source"):
+        if pname != package:
             continue
         if expected_eco and eco != expected_eco:
             continue
@@ -321,7 +328,7 @@ def advisory_fix_version(vuln, package, release, expected_eco=None):
         return None
     best = None
     for eco, aff in candidates:
-        if release and release != "unknown" and eco.endswith(release):
+        if release and release != "unknown" and eco == release:
             best = aff  # release-exact entry wins
             break
         if best is None:
@@ -333,6 +340,14 @@ def advisory_fix_version(vuln, package, release, expected_eco=None):
             if "fixed" in ev:
                 return ev["fixed"]
     return None
+
+
+def deb_version_lt(installed, fixed):
+    """Use dpkg's Debian version ordering; unavailable comparison fails closed."""
+    if not shutil.which("dpkg"):
+        return False
+    rc, _, _ = run(["dpkg", "--compare-versions", installed, "lt", fixed], timeout=5)
+    return rc == 0
 
 
 def classify(fix_available, kev, severity):
@@ -368,7 +383,16 @@ def match_inventory(inv, cfg, kev_ids, fetch_detail):
         """Fetch one advisory. Cache hits are free; only real fetches count
         against the per-run cap (otherwise repeats would starve fresh ids).
         Returns the detail dict, or None when deferred/failed (already counted)."""
+        cache_path = os.path.join(os.path.expanduser(cfg["cache_dir"]), "osv", vid.replace("/", "_") + ".json")
         if cov["advisories_fetched"] >= cap:
+            try:
+                fresh = time.time() - os.path.getmtime(cache_path) <= cfg.get("detail_cache_ttl", 86400)
+                with open(cache_path, encoding="utf-8") as f:
+                    cached_detail = json.load(f)
+                if fresh and cached_detail.get("id") == vid:
+                    return cached_detail
+            except (OSError, ValueError):
+                pass
             cov["deferred"] += 1
             cov["cap_hit"] = True
             return None
@@ -411,7 +435,6 @@ def match_inventory(inv, cfg, kev_ids, fetch_detail):
                                  for a in detail.get("affected", []))
                     if not eco_ok:
                         continue  # name collision in another ecosystem
-                    cov["advisories_fetched"] += 1
                     fixed = advisory_fix_version(detail, item["name"], None,
                                                  expected_eco="PyPI")
                     cve = extract_cve(detail)
@@ -419,29 +442,19 @@ def match_inventory(inv, cfg, kev_ids, fetch_detail):
                     sev = (detail.get("database_specific") or {}).get("severity")
                     cls = classify(fixed is not None, kev, sev)
                     why = f"fix={'あり(' + fixed + ')' if fixed else 'なし'} / KEV={kev}"
-                    fp = fingerprint("PyPI", item["name"], vid)
+                    fp = fingerprint("PyPI:" + item.get("environment", "local"), item["name"], vid)
                     findings.append({
                         "fingerprint": fp, "class": cls, "reason": why,
-                        "ecosystem": "PyPI", "host": "local", "package": item["name"],
+                        "ecosystem": "PyPI", "host": item.get("environment", "local"), "package": item["name"],
                         "installed_version": item["version"], "advisory_id": vid,
                         "cve": cve, "fix": fixed or "なし", "kev": kev,
                         "severity": sev or "未取得",
                         "summary": (detail.get("summary") or detail.get("details") or "")[:200],
                         "source_url": f"https://osv.dev/vulnerability/{vid}",
                     })
-            # packages that share a name but were returned clean are counted; the
-            # rest of inv entries not in seen_pairs were also clean:
-            cov["clean_packages"] += len(inv["pypi"]) - len(seen_pairs)
 
-    # --- deb hosts (ssh) — advisory-level matching, distro as fix oracle ---
-    # A full Ubuntu fleet returns 10k+ (package, advisory) pairs, so per-pair
-    # detail fetches are out of budget. Instead:
-    #   querybatch (purl, source@version) — ecosystem- and version-exact
-    #   CVE comes from the advisory id (UBUNTU-CVE-...); KEV from the set
-    #   fix status comes from `apt-get -s upgrade` (read-only sim, collected
-    #     at inventory time): a pending upgrade for a package of that source
-    #     IS the distro's fix; no pending upgrade = no reachable fix yet.
-    # Detail fetches happen only for ids that don't carry a CVE (rare).
+    # --- deb hosts (ssh): only exact distro advisory details prove fixes ---
+    # Generic apt candidates are useful context but are not advisory evidence.
     for host_name, host_inv in inv["deb_hosts"].items():
         rel = host_inv["release"]
         distro = host_inv.get("distro", "ubuntu")
@@ -465,10 +478,7 @@ def match_inventory(inv, cfg, kev_ids, fetch_detail):
                 cov["clean_packages"] += 1
                 continue
             if len(vulns) >= OSV_CAP:
-                # The advisory list for this source exceeds the API cap; the
-                # returned subset is arbitrary and flips between runs, so
-                # per-advisory processing here would hallucinate diffs. Fall
-                # back to the distro oracle only (one honest rollup row).
+                # The advisory list may be truncated; do not infer fixes from it.
                 capped[pkg["source"]] = sorted((p["name"], p["version"]) for p in pkgs
                                                if p["source"] == pkg["source"])
                 continue
@@ -478,17 +488,12 @@ def match_inventory(inv, cfg, kev_ids, fetch_detail):
                     adv_sources.setdefault(vid, set()).add(pkg["source"])
         cov["capped_packages"] = cov.get("capped_packages", []) + [
             f"{host_name}:{s}" for s in sorted(capped)]
-        binary_to_source = {p["name"]: p["source"] for p in pkgs}
-        upg_src = {}
-        for b, cand in host_inv.get("upgradable", {}).items():
-            upg_src.setdefault(binary_to_source.get(b, b), cand)
         for src, affected in capped.items():
-            fix_cand = upg_src.get(src)
-            cls = classify(fix_cand is not None, False, None)
+            cls = classify(False, False, None)
             ver_disp = ", ".join(f"{n}={v}" for n, v in affected[:5])
             if len(affected) > 5:
                 ver_disp += f" ほか{len(affected) - 5}件"
-            fix = f"あり(apt候補 {fix_cand})" if fix_cand else "なし"
+            fix = "判定不能（OSV上限）"
             findings.append({
                 "fingerprint": fingerprint(f"deb:{host_name}", "cap", f"OSV:cap:{src}"),
                 "class": cls,
@@ -497,29 +502,47 @@ def match_inventory(inv, cfg, kev_ids, fetch_detail):
                 "package": src, "installed_version": ver_disp,
                 "advisory_id": f"OSV:cap:{src}", "cve": None, "fix": fix,
                 "kev": False, "severity": "判定不能",
-                "summary": "影響advisoryがOSV querybatch上限(1000)超過で列挙不能。"
-                           "distro更新の適用で一括解消するため、apt候補の有無で判定。",
+                "summary": "影響advisoryがOSV querybatch上限(1000)超過で列挙不能。",
                 "source_url": f"https://launchpad.net/ubuntu/+source/{src}",
             })
         if not adv_sources:
             continue
         for vid, sources in adv_sources.items():
             m = CVE_RE.search(vid)
-            if not m:
-                detail = get_detail(vid)  # rare: resolve the CVE via the advisory
-                if detail:
-                    m = CVE_RE.search(" ".join([detail.get("id", "")] +
-                                               detail.get("aliases", [])))
+            detail = get_detail(vid)
+            if detail and not m:
+                aliases = detail.get("aliases", [])
+                m = CVE_RE.search(" ".join([detail.get("id", "")] +
+                                           [a for a in aliases if isinstance(a, str)]))
             cve = m.group(0) if m else None
             kev = bool(cve and cve in kev_ids)
             affected = sorted((p["name"], p["version"]) for p in pkgs
                               if p["source"] in sources)
-            fix_cand = next((upg_src[s] for s in sorted(sources) if s in upg_src), None)
-            cls = classify(fix_cand is not None, kev, None)
+            distro = host_inv.get("distro", "unknown").lower()
+            eco = (f"Ubuntu:{rel}:LTS" if distro == "ubuntu" else
+                   f"Debian:{rel}" if distro == "debian" else "")
+            source = next(iter(sources)) if len(sources) == 1 else None
+            exact_affected = bool(detail and eco and source and any(
+                (a.get("package") or {}).get("name") == source and
+                (a.get("package") or {}).get("ecosystem") == eco
+                for a in detail.get("affected", [])))
+            fixed = (advisory_fix_version(detail, source, eco, expected_eco=eco)
+                     if exact_affected else None)
+            proven_fixed = bool(fixed and affected and all(deb_version_lt(v, fixed)
+                                                           for _, v in affected))
+            if proven_fixed:
+                fix = f"あり(OSV固定版 {fixed})"
+            elif not exact_affected:
+                fix = "判定不能（OSV詳細/source/ecosystem未確認）"
+            elif fixed:
+                fix = "判定不能（OSV固定版/比較を確認できず）"
+            else:
+                fix = "なし"
+            cls = classify(proven_fixed, kev, None)
             ver_disp = ", ".join(f"{n}={v}" for n, v in affected[:5])
             if len(affected) > 5:
                 ver_disp += f" ほか{len(affected) - 5}件"
-            fix = f"あり(apt候補 {fix_cand})" if fix_cand else "なし"
+
             src_disp = ", ".join(sorted(sources)[:5])
             if len(sources) > 5:
                 src_disp += f" ほか{len(sources) - 5}件"
@@ -531,7 +554,7 @@ def match_inventory(inv, cfg, kev_ids, fetch_detail):
                 "package": src_disp, "installed_version": ver_disp,
                 "advisory_id": vid, "cve": cve, "fix": fix, "kev": kev,
                 "severity": "未取得",
-                "summary": "",
+                "summary": (detail.get("summary") or "")[:200] if detail else "",
                 "source_url": f"https://osv.dev/vulnerability/{vid}",
             })
 
@@ -546,6 +569,7 @@ def match_inventory(inv, cfg, kev_ids, fetch_detail):
                 stale = True
                 latest = None
             if latest is None:
+                stale = True
                 drift.append({"name": name, "installed": installed,
                               "latest": "判定不能（索引取得失敗）"})
             elif latest != installed:
@@ -621,8 +645,9 @@ def diff_findings(findings, state, cfg, kev_ids):
     for f in findings:
         fp = f["fingerprint"]
         old = prev.get(fp)
-        sig = (f["class"], f["fix"], f["kev"])
-        old_sig = (old.get("class"), old.get("fix"), old.get("kev")) if old else None
+        sig = (f["class"], f["fix"], f["kev"], f.get("installed_version"), f.get("severity"), f.get("summary"))
+        old_sig = (old.get("class"), old.get("fix"), old.get("kev"), old.get("installed_version"),
+                   old.get("severity"), old.get("summary")) if old else None
         acc = is_accepted(f, cfg, kev_ids) or ignore_hit(f, cfg)
         if acc:
             f["class"] = f["class"] + "（accepted）"
@@ -647,9 +672,15 @@ def diff_findings(findings, state, cfg, kev_ids):
 
 # ---------------------------------------------------------------- report
 def anonymize(text, cfg, inv):
-    for i, host in enumerate(sorted(cfg["deb_hosts"], key=lambda h: h["name"]), 1):
-        text = text.replace(host["name"], f"host-{i}")
-    text = re.sub(r"/Users/[A-Za-z0-9_.-]+", "~", text)
+    for i, host in enumerate(sorted(cfg.get("deb_hosts", []), key=lambda h: h["name"]), 1):
+        text = re.sub(r"(?<![\w-])" + re.escape(host["name"]) + r"(?![\w-])", f"host-{i}", text)
+        if host.get("user"):
+            text = re.sub(r"(?<![\w.-])" + re.escape(host["user"]) + r"(?![\w.-])", "<USER>", text)
+    home = os.path.expanduser("~")
+    if home and home != "/":
+        text = text.replace(home, "~")
+    text = re.sub(r"/home/(?:[A-Za-z0-9_.-]+|<USER>)", "~", text)
+    text = re.sub(r"/Users/(?:[A-Za-z0-9_.-]+|<USER>)", "~", text)
     text = re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "<IP>", text)
     for pat, rep in cfg.get("anonymize_extra", []):
         text = re.sub(pat, rep, text)
@@ -697,13 +728,16 @@ def render_briefing(findings, drift, cov, inv, cfg, errors, run_ts, first):
                  f"{cov['advisories_fetched']} | deferred: {cov['deferred']} | "
                  f"clean packages: {cov['clean_packages']}")
     lines.append(f"- gate dropped (unverifiable lines): {cov.get('gate_dropped', 0)}")
+    if (cov.get("fetch_errors") or cov.get("deferred") or cov.get("cap_hit") or
+            cov.get("capped_packages") or cov.get("gate_dropped")):
+        lines.append("- **DEGRADED — coverage incomplete; not a full-success scan**")
     if cov.get("brew_stale_index"):
         lines.append("- brew index: STALE — drift verdicts are 判定不能")
     if cov.get("capped_packages"):
-        lines.append(f"- OSV 1000-cap (advisory list truncated; apt-oracle only): "
+        lines.append(f"- OSV 1000-cap (advisory list truncated; fix status unknown): "
                      + ", ".join(cov["capped_packages"]))
     if errors:
-        lines.append(f"- **errors ({len(errors)}): degraded run — see below**")
+        lines.append(f"- **DEGRADED — incomplete scan ({len(errors)} errors): do not treat as full-success**")
         for e in errors:
             lines.append(f"  - {e}")
     lines.append(f"- not monitored (by design, review quarterly): "
@@ -758,7 +792,8 @@ def render_briefing(findings, drift, cov, inv, cfg, errors, run_ts, first):
 
 
 def render_alert(new_alerts, run_ts, briefing_path):
-    lines = [f"## secbrief alert — {run_ts}", ""]
+    degraded = any(f.get("class") == "点検失敗（degraded）" for f in new_alerts)
+    lines = [f"## secbrief alert{' — DEGRADED' if degraded else ''} — {run_ts}", ""]
     must = [f for f in new_alerts if f["class"].startswith("要対応")]
     rec = [f for f in new_alerts if f["class"] == "推奨"]
     for f in sorted(must, key=lambda x: (x["class"] != "要対応", x["package"])):
@@ -784,11 +819,16 @@ def render_alert(new_alerts, run_ts, briefing_path):
 # ---------------------------------------------------------------- paste pack
 def build_paste_pack(briefing_path, cfg, out_path):
     prompt_path = os.path.join(HERE, "PROMPT.md")
-    prompt = open(prompt_path, encoding="utf-8") if os.path.exists(prompt_path) else io.StringIO(
-        "(PROMPT.mdが見つかりません。それでも以下のブリーフィングの事実のみで説明してください)\n")
+    if os.path.exists(prompt_path):
+        with open(prompt_path, encoding="utf-8") as f:
+            prompt = f.read()
+    else:
+        prompt = "(PROMPT.mdが見つかりません。それでも以下のブリーフィングの事実のみで説明してください)\n"
     with open(briefing_path, encoding="utf-8") as f:
         body = f.read()
-    pack = prompt.read() + "\n\n---\n\n# 環境ブリーフィング（機械生成・事実のみ）\n\n" + body
+    if cfg.get("paste_anonymize", True):
+        body = anonymize(body, cfg, {})
+    pack = prompt + "\n\n---\n\n# 環境ブリーフィング（機械生成・事実のみ）\n\n" + body
     atomic_write(out_path, pack)
     return out_path
 
@@ -813,7 +853,10 @@ def cmd_run(cfg, baseline=False, as_anon=False):
 
     new_alerts, changed, unchanged, first_run = diff_findings(all_show, state, cfg, kev_ids)
 
-    engines_ok = not errors and kev_ok
+    complete = (not errors and kev_ok and not cov.get("fetch_errors") and
+                not cov.get("deferred") and not cov.get("cap_hit") and
+                not cov.get("capped_packages") and not cov.get("brew_stale_index") and not dropped)
+    engines_ok = complete
     briefing = render_briefing(all_show, drift, cov, inv, cfg, errors, run_ts,
                                first or first_run)
     if as_anon:
@@ -829,7 +872,8 @@ def cmd_run(cfg, baseline=False, as_anon=False):
         for f in all_show:
             state["fingerprints"][f["fingerprint"]] = {
                 "class": f["class"].replace("（accepted）", ""),
-                "fix": f["fix"], "kev": f["kev"], "last_seen": run_ts}
+                "fix": f["fix"], "kev": f["kev"], "installed_version": f.get("installed_version"),
+                "severity": f.get("severity"), "summary": f.get("summary"), "last_seen": run_ts}
         state["baseline"] = True
         state["last_full_success"] = run_ts
         save_state(cfg, state)
@@ -858,7 +902,7 @@ def cmd_run(cfg, baseline=False, as_anon=False):
     print(f"findings: 要対応={n('要対応')+n('要対応（緩和）')} "
           f"推奨={n('推奨')} 観察={n('観察')} 不要={n('不要')} | "
           f"new alerts: {len(new_alerts)} | degraded: {not engines_ok}")
-    return 0
+    return 0 if engines_ok else 2
 
 
 def cmd_doctor(cfg):
@@ -904,7 +948,9 @@ def main(argv=None):
     sub.add_parser("init", help="create config.json from the example", parents=[common])
     p_paste = sub.add_parser("paste", help="build a single-file pack for any LLM",
                              parents=[common])
-    p_paste.add_argument("--anonymize", action="store_true", default=True)
+    p_paste.add_argument("--no-anonymize", action="store_false", dest="anonymize",
+                         help="include configured host and user identifiers")
+    p_paste.set_defaults(anonymize=True)
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
     if args.cmd == "run":
@@ -920,7 +966,9 @@ def main(argv=None):
             print("no briefing yet — run `secbrief.py run` first", file=sys.stderr)
             return 1
         out = os.path.join(out_dir, "secbrief-paste.md")
-        print(build_paste_pack(bpath, cfg, out))
+        paste_cfg = dict(cfg)
+        paste_cfg["paste_anonymize"] = args.anonymize
+        print(build_paste_pack(bpath, paste_cfg, out))
         return 0
     return 1
 

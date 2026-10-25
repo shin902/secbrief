@@ -9,9 +9,11 @@ markdown briefing. It changes nothing on your machines.
 ## What secbrief deliberately does not do
 
 - **No automatic patching.** Nothing is upgraded, restarted, or removed, ever.
-- **No outbound data.** The only network traffic is: fetches FROM the three
-  feeds, and SSH to the hosts you configured (read-only `dpkg-query`). The
-  briefing/alerts never leave the machine unless you move them.
+- **Outbound metadata.** OSV querybatch receives installed package names, versions,
+  ecosystems and Debian/Ubuntu source package identifiers so it can match the
+  inventory. The only other network traffic is fetches FROM OSV.dev, CISA KEV,
+  formulae.brew.sh, and SSH to configured hosts (read-only package/OS release
+  inventory and an apt simulation). Briefings and alerts are not uploaded.
 - **No secrets in the repo or config.** `config.json` holds hostnames and
   paths only. `.gitignore` excludes it, plus `state/`, `cache/`, `alerts/`.
 - **No shell from advisory text.** CVE descriptions are stored data. The

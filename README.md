@@ -1,5 +1,7 @@
 # secbrief
 
+> Fork additions: [approval-gated operations](extras/OPERATIONS.ja.md), host/runtime inventory, Electron dependencies, primary-source tracking, local/Discord delivery and systemd timer generation. Remediation requires explicit per-plan approval. Generic apt candidates never prove a CVE fix; truncated scans degrade instead of guessing.
+
 **English** | [한국어](README.ko.md) | [中文](README.zh.md) | [日本語](README.ja.md)
 
 **A daily vulnerability briefing for AI-agent-managed machines.**

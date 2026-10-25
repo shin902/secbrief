@@ -1,0 +1,16 @@
+{
+  "schema": "secbrief-automation/config-v1",
+  "runner": "./secbrief_extra.py",
+  "output": "./secbrief-extra-out",
+  "state_dir": "./.secbrief-automation-state",
+  "lockfiles": [],
+  "asar": [],
+  "online": false,
+  "inventory_sources_config": "./sources.example.json",
+  "inventory_sources_online": false,
+  "inventory_sources_probe_runtimes": false,
+  "scan_timeout": 300,
+  "notification": { "type": "local" },
+  "env_allowlist": [],
+  "remediation_plans": {}
+}
