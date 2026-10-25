@@ -5,6 +5,10 @@ description: Use when an agent operates secbrief. Delegate scheduling and notifi
 
 # Secbrief operations
 
+## User-facing report format
+
+Report only two tables: (1) application/tool | installation evidence/status | owning repository, and (2) affected repository | local root. Deduplicate by owning repository. Never include an all-matches appendix, raw JSON, dependency/CVE dumps or scan totals in the user-facing document; keep them in separate local evidence. Exclude cache-only, maintenance-only, fixture/vendor-only and user-reported uninstalled application findings from the default view. Do not infer installation or binary build provenance from source lockfiles. Add at most one coverage caveat and one evidence link. If app attribution is unknown, report the repository without inventing an installed app.
+
 Read `extras/OPERATIONS.ja.md` in the repository for commands and configuration.
 
 - Use host-native scheduling and delivery: Hermes/OpenClaw cron, launchd, systemd or cron as appropriate. Do not build a second scheduler or notification client in this repository.
