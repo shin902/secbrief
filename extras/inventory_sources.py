@@ -11,6 +11,7 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
@@ -180,19 +181,45 @@ def _collect_containers(config, probe, errors):
 def _fetch_json(url, timeout=30):
     if not isinstance(url, str) or not url.startswith("https://"):
         raise ValueError("source URL must use https")
-    request = urllib.request.Request(url, headers={"User-Agent": "secbrief-inventory-sources/1.0", "Accept": "application/json"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        data = response.read(MAX_FEED + 1)
-        final_url = response.geturl()
-    if len(data) > MAX_FEED:
-        raise ValueError("feed exceeds size limit")
-    parsed = json.loads(data)
+    parsed_url = urlsplit(url)
+    paginated = parsed_url.netloc == 'api.github.com' and bool(re.fullmatch(r'/repos/[^/]+/[^/]+/security-advisories', parsed_url.path))
+    current=url; pages=[]; rows=[]; visited=set(); final_url=url; parsed=None
+    for _ in range(100 if paginated else 1):
+        if current in visited: raise ValueError('source pagination loop')
+        visited.add(current)
+        request = urllib.request.Request(current, headers={"User-Agent": "secbrief-inventory-sources/1.0", "Accept": "application/json"})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data=response.read(MAX_FEED+1); final_url=response.geturl()
+            link=response.headers.get('Link','') if paginated else ''
+        if len(data)>MAX_FEED: raise ValueError('feed exceeds size limit')
+        parsed=json.loads(data); pages.append(hashlib.sha256(data).hexdigest())
+        if paginated:
+            if not isinstance(parsed,list) or any(not isinstance(x,dict) or not x.get('ghsa_id') for x in parsed):
+                raise ValueError('invalid repository advisory list schema')
+            rows.extend(parsed)
+        next_url=next((m.group(1) for m in re.finditer(r'<([^>]+)>;\s*rel="([^"]+)"',link) if m.group(2)=='next'),None)
+        if not next_url: break
+        nxt=urlsplit(next_url)
+        if nxt.scheme!='https' or nxt.netloc!=parsed_url.netloc or nxt.path!=parsed_url.path:
+            raise ValueError('untrusted pagination target')
+        current=next_url
+    else:
+        if paginated: raise ValueError('source pagination limit exceeded')
     return {"source_url": url, "retrieved_at": utc_now(),
-            "sha256": hashlib.sha256(data).hexdigest(), "final_url": final_url,
-            "document": parsed}
+            "sha256": hashlib.sha256(''.join(pages).encode()).hexdigest() if paginated else pages[0],
+            "final_url": final_url, "pages":len(pages), "document":rows if paginated else parsed}
 
 
 def _fetch_source(url, source_format="json"):
+    if source_format == 'node-core-json':
+        if url != 'https://raw.githubusercontent.com/nodejs/security-wg/main/vuln/core/index.json':
+            raise ValueError('unsupported Node database origin')
+        snapshot=_fetch_json(url)
+        doc=snapshot['document']
+        if not isinstance(doc,dict) or not doc or any(not isinstance(v,dict) or not isinstance(v.get('vulnerable'),str) for v in doc.values()):
+            raise ValueError('invalid Node core index')
+        snapshot['document']={'node_core':[dict(row,_record_id=key) for key,row in doc.items()]}
+        return snapshot
     if source_format == "json":
         return _fetch_json(url)
     if source_format not in ("rss", "atom"):
@@ -365,7 +392,15 @@ def _release_drift(assets, snapshots, source_url=None):
                     latest = ".".join(match.groups())
         for asset in assets:
             if asset.get("ecosystem", "").lower() == "electron" and asset.get("version") and latest:
+                exact=next((r for r in candidates if isinstance(r,dict) and str(r.get('version','')).lstrip('v')==asset['version']),None)
+                components={k:exact[k] for k in ('node','chrome','v8','openssl','zlib','uv','modules') if exact and exact.get(k)}
+                major=str(asset['version']).split('.')[0]
+                branch=[v for t,v in stable if str(t[0])==major]
+                branch_latest=max(branch,key=lambda v:tuple(map(int,v.split('.')))) if branch else None
                 updates.append({"asset": asset, "latest_release": latest,
+                                "same_major_latest":branch_latest,
+                                "installed_release_components":components,
+                                "component_mapping_status":"exact_official_release" if components else "unknown",
                                 "drift": asset["version"] != str(latest),
                                 "security_fixed": "unknown",
                                 "evidence": {k: snap[k] for k in ("source_url", "retrieved_at", "sha256")}})
@@ -397,6 +432,10 @@ def collect(config, probe_runtimes=False, online=False):
     if online:
         sources = list(config.get("primary_json_urls", []))
         sources.extend(config.get("primary_sources", []))
+        if config.get("primary_source_catalog"):
+            catalog=json.loads(Path(__file__).with_name('primary_sources.json').read_text())
+            sources.extend(catalog if isinstance(catalog,list) else catalog['sources'])
+        sources=list({(s if isinstance(s,str) else s['url']):s for s in sources}.values())
         for source in sources:
             url = source if isinstance(source, str) else source.get("url")
             try:
@@ -405,6 +444,9 @@ def collect(config, probe_runtimes=False, online=False):
                 _add_error(errors, url, exc)
         findings.extend(_check_osv(assets, errors))
         findings.extend(_reviewed_findings(assets, snapshots, config.get("reviewed_rules", []), errors))
+        from vendor_advisories import map_advisories
+        vendor_findings, vendor_errors=map_advisories(assets,snapshots)
+        findings.extend(vendor_findings); errors.extend(vendor_errors)
         updates = _release_drift(assets, snapshots, config.get("electron_release_url"))
     coverage.update({"asset_count": len(assets), "unmatched_surfaces": [
                          "OS vendor package advisories: no configured vendor advisory rules",
@@ -430,6 +472,9 @@ def augment_assets(report, assets, config):
         if key not in known:
             report['assets'].append(asset); added.append(asset); known.add(key)
     if report.get('coverage',{}).get('network_enabled'):
+        from vendor_advisories import map_advisories
+        mapped, failures=map_advisories(added,report['source_snapshots'])
+        report['advisories'].extend(mapped); report['errors'].extend(failures)
         report['advisories'].extend(_reviewed_findings(added,report['source_snapshots'],config.get('reviewed_rules',[]),report['errors']))
         report['release_drift']=_release_drift(report['assets'],report['source_snapshots'],config.get('electron_release_url'))
     report.setdefault('coverage', {})['asset_count']=len(report['assets'])

@@ -10,7 +10,6 @@
   "inventory_sources_online": false,
   "inventory_sources_probe_runtimes": false,
   "scan_timeout": 300,
-  "notification": { "type": "local" },
   "env_allowlist": [],
   "remediation_plans": {}
 }

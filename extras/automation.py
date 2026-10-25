@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Deterministic orchestration for secbrief-extra; no implicit remediation."""
+"""One-shot secbrief automation; host owns scheduling and notifications."""
 from __future__ import annotations
-import argparse, fcntl, hashlib, json, os, re, secrets, signal, subprocess, sys, tempfile, time, urllib.error, urllib.request
+import argparse, fcntl, hashlib, json, os, re, secrets, signal, subprocess, sys, tempfile, time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -47,7 +47,6 @@ def load_config(path):
     for k in ("inventory_sources_online", "inventory_sources_probe_runtimes", "probe_runtime"):
         if k in c and not isinstance(c[k], bool): raise AutomationError(f"config.{k} must be boolean")
     if "scan_timeout" in c and (not isinstance(c["scan_timeout"], int) or isinstance(c["scan_timeout"], bool) or not 1 <= c["scan_timeout"] <= 3600): raise AutomationError("config.scan_timeout must be 1..3600 seconds")
-    if "notification" in c and (not isinstance(c["notification"], dict) or c["notification"].get("type", "local") not in ("local", "discord")): raise AutomationError("notification must be local or discord")
     if "env_allowlist" in c and (not isinstance(c["env_allowlist"], list) or not all(isinstance(x,str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*",x) for x in c["env_allowlist"])): raise AutomationError("env_allowlist must contain environment variable names")
     base=Path(path).expanduser().resolve().parent
     for key in ("runner","output","state_dir","inventory_sources_config","electron_binary","core_config"):
@@ -68,49 +67,7 @@ def run_runner(c):
     return subprocess.run(args, capture_output=True, text=True, timeout=int(c.get("scan_timeout", 300)), check=False,
                           env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "")})
 
-def append_receipt(path, obj):
-    p = Path(path); p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    try:
-        os.write(fd, (json.dumps(obj, sort_keys=True, ensure_ascii=False) + "\n").encode()); os.fsync(fd)
-    finally: os.close(fd)
-
-def discord_send(cfg, message, state_dir, attempt_id):
-    """At-most-once attempt: an interrupted/unknown outcome is never retried."""
-    secret = cfg.get("webhook_env")
-    if secret:
-        url = os.environ.get(secret)
-    elif cfg.get("webhook_file"):
-        p = Path(cfg["webhook_file"]).expanduser()
-        if p.resolve().is_relative_to(Path(__file__).resolve().parent.parent): raise AutomationError("webhook secret file must be outside repository")
-        url = p.read_text(encoding="utf-8").strip()
-    else: raise AutomationError("Discord webhook secret not configured")
-    if not url or not url.startswith("https://discord.com/api/webhooks/"): raise AutomationError("invalid Discord webhook configuration")
-    # Never persist the URL or response body; reserve before POST to prevent duplicate delivery.
-    marker = Path(state_dir) / ("discord-attempt-" + hashlib.sha256(attempt_id.encode()).hexdigest()[:16] + ".json")
-    if marker.exists(): return {"status": "not_sent", "reason": "a previous attempt exists; automatic resend forbidden"}
-    atomic_json(marker, {"status": "attempt_reserved", "at": datetime.now(timezone.utc).isoformat()})
-    req = urllib.request.Request(url + "?wait=true", data=json.dumps({"content": message[:1900], "allowed_mentions": {"parse": []}}).encode(), headers={"Content-Type": "application/json"}, method="POST")
-    mid = None
-    try:
-        with urllib.request.urlopen(req, timeout=int(cfg.get("timeout", 10))) as r: posted = json.loads(r.read(65536))
-        mid = posted.get("id")
-        if not isinstance(mid, str) or not mid.isdigit(): raise AutomationError("Discord POST returned no valid message id")
-        atomic_json(marker, {"status":"posted_unverified", "message_id":mid})
-        # Discord webhook GET; secret remains only in memory and is never included in errors/receipts.
-        verify = urllib.request.Request(url.rstrip("/") + "/messages/" + mid, headers={"User-Agent": "secbrief-automation"})
-        with urllib.request.urlopen(verify, timeout=int(cfg.get("timeout", 10))) as r: confirmed = json.loads(r.read(65536))
-        ok = confirmed.get("id") == mid and confirmed.get("content") == message[:1900]
-        result = {"status": "verified" if ok else "unknown", "message_id": mid}
-    except Exception as e:
-        # Deliberately discard exception details: urllib errors may embed secret URLs.
-        result = {"status": "unknown", "error": type(e).__name__}
-        if mid is not None: result["message_id"] = mid
-    atomic_json(marker, result)
-    return result
-
 def source_signature(report):
-    # Strip retrieval times recursively; repeated evidence must remain silent.
     def stable(value):
         if isinstance(value,dict): return {k:stable(v) for k,v in value.items() if k not in ("retrieved_at","generated_at")}
         if isinstance(value,list): return [stable(v) for v in value]
@@ -118,12 +75,13 @@ def source_signature(report):
     return stable({k:report.get(k) for k in ("assets","runtimes","containers","advisories","release_drift")} | {"sources":[{"url":x.get("source_url"),"sha256":x.get("sha256")} for x in report.get("source_snapshots",[])]})
 
 def cycle(config_path):
-    c=load_config(config_path); state=Path(c["state_dir"]).expanduser(); state.mkdir(parents=True,exist_ok=True,mode=0o700)
-    with (state/"cycle.lock").open("a") as lock:
-        fcntl.flock(lock,fcntl.LOCK_EX)
-        started=datetime.now(timezone.utc).isoformat()
-        receipt: dict={"schema":"secbrief-automation/receipt-v1","started_at":started}
-        try:
+    """Run one scan and emit a JSON status for the caller to handle."""
+    started=datetime.now(timezone.utc).isoformat()
+    result: dict={"schema":"secbrief-automation/result-v1","started_at":started}
+    try:
+        c=load_config(config_path); state=Path(c["state_dir"]).expanduser(); state.mkdir(parents=True,exist_ok=True,mode=0o700)
+        with (state/"cycle.lock").open("a") as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
             sources=None; source_changed=False; signature=None; core_record=None; core_changed=False
             if c.get("core_config"):
                 if not c.get("online"): raise AutomationError("core_config requires online=true because core queries OSV")
@@ -132,8 +90,8 @@ def cycle(config_path):
                 if core_proc.returncode: raise AutomationError("core scan degraded; inspect its briefing")
                 core_cfg=strict_json(Path(c["core_config"]))
                 alert_path=Path(core_cfg.get("alert_file","~/.secbrief/alerts/SECBRIEF-ALERT.md")).expanduser()
-                core_offset_file=state/"core-alert-offset.json"
-                previous_offset=json.loads(core_offset_file.read_text()).get("offset",0) if core_offset_file.exists() else 0
+                offset_file=state/"core-alert-offset.json"
+                previous_offset=json.loads(offset_file.read_text()).get("offset",0) if offset_file.exists() else 0
                 end=alert_path.stat().st_size if alert_path.exists() else 0
                 core_changed=end!=previous_offset
                 core_record={"alert_file":str(alert_path),"offset":end,"changed":core_changed}
@@ -146,12 +104,10 @@ def cycle(config_path):
                 source_state=state/"source-state.json"
                 previous=json.loads(source_state.read_text()) if source_state.exists() else None
                 signature=source_signature(sources)
-                # First run surfaces findings; an empty first inventory is only a baseline.
                 source_changed=(signature != previous) if previous is not None else bool(sources.get("advisories") or sources.get("release_drift"))
             proc=run_runner(c)
             outdir=Path(c["output"]).expanduser()
             report=strict_json(outdir/"report.json") if (outdir/"report.json").exists() else {}
-            alerts=strict_json(outdir/"alerts.json") if (outdir/"alerts.json").exists() else {}
             code=proc.returncode
             if code not in (0,10) or report.get("status") not in ("complete","inventory_only") or (code==10 and report.get("status")!="complete"):
                 raise AutomationError(f"scan failed: runner exit={code}; report={report.get('status')}")
@@ -178,27 +134,13 @@ def cycle(config_path):
                 report["core"]=core_record; atomic_json(outdir/"report.json",report)
                 atomic_json(state/"core-alert-offset.json",{"offset":core_record["offset"]})
             status="changed" if code==10 or source_changed or core_changed else "nochange"
-            receipt.update(status=status,runner_exit=code,report_status=report.get("status"),change_count=report.get("change_count"),source_changed=source_changed,finished_at=datetime.now(timezone.utc).isoformat())
-            if status=="changed":
-                msg=f"secbrief changed: findings={report.get('change_count')}, host/source changes={source_changed}, core changes={core_changed}. Review {outdir/'report.md'}. Remediation requires approval."
-                append_receipt(state/"outbox.jsonl",{"at":started,"message":msg,"alerts":alerts.get("changed",[])})
-                notify=c.get("notification",{"type":"local"})
-                receipt["notification"]=discord_send(notify,msg,state,started) if notify.get("type")=="discord" else {"status":"queued_local"}
-                if receipt["notification"]["status"] not in ("verified","queued_local"):
-                    receipt["status"]="delivery_unknown"
-                    append_receipt(state/"receipts.jsonl",receipt)
-                    print("notification outcome unknown; no automatic resend",file=sys.stderr); return 2
-            append_receipt(state/"receipts.jsonl",receipt)
+            result.update(status=status,runner_exit=code,report_status=report.get("status"),change_count=report.get("change_count"),source_changed=source_changed,core_changed=core_changed,report=str(outdir/"report.json"),finished_at=datetime.now(timezone.utc).isoformat())
+            print(json.dumps(result,ensure_ascii=False))
             return 0
-        except Exception as e:
-            message=f"cycle failed: {type(e).__name__}: {e}"
-            receipt.update(status="failed",error=message,finished_at=datetime.now(timezone.utc).isoformat())
-            append_receipt(state/"outbox.jsonl",{"at":started,"kind":"failure","message":message})
-            if c.get("notification",{}).get("type")=="discord":
-                try: receipt["notification"]=discord_send(c["notification"],message,state,started+":failure")
-                except Exception as delivery_error: receipt["notification"]={"status":"failed","error":type(delivery_error).__name__}
-            append_receipt(state/"receipts.jsonl",receipt)
-            print(message,file=sys.stderr); return 2
+    except Exception as e:
+        result.update(status="failed",error=f"{type(e).__name__}: {e}",finished_at=datetime.now(timezone.utc).isoformat())
+        print(json.dumps(result,ensure_ascii=False))
+        return 2
 
 def plan_data(c, name):
     plans = c.get("remediation_plans", {})
@@ -227,7 +169,6 @@ def plan_data(c, name):
     return result
 
 def _execute(argv, plan, out):
-    # Only literal, hash-bound values; inherited values must not change an approved plan.
     env = dict(plan["env"])
     proc = subprocess.Popen(argv, cwd=plan["cwd"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     streams={proc.stdout:"stdout",proc.stderr:"stderr"}; buffers={"stdout":bytearray(),"stderr":bytearray()}
@@ -271,10 +212,8 @@ def execute_plan(plan_path, approval):
     actual=digest({k:v for k,v in p.items() if k != "plan_hash"})
     if p.get("plan_hash") != actual: raise AutomationError("plan hash mismatch")
     if not secrets.compare_digest(actual, approval or ""): raise AutomationError("human approval denied: exact --approve plan hash required")
-    # Reserve once, after approval; interrupted or failed attempts require a new reviewed plan.
     marker=Path(p["cwd"])/(".secbrief-approved-"+actual+".json")
-    try:
-        fd=os.open(marker, os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600)
+    try: fd=os.open(marker, os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600)
     except FileExistsError: raise AutomationError("approved plan was already attempted; inspect receipt before a new plan")
     with os.fdopen(fd,"w") as stream:
         json.dump({"plan_hash":actual,"status":"attempt_reserved"},stream); stream.flush(); os.fsync(stream.fileno())
@@ -296,8 +235,7 @@ def execute_plan(plan_path, approval):
 
 def agent_plan(config_path, output, command=None):
     c=load_config(config_path)
-    if command or c.get("agent_command"):
-        raise AutomationError("arbitrary agent subprocesses are not read-only sandboxes; export the review request and use a read-only agent session")
+    if command or c.get("agent_command"): raise AutomationError("arbitrary agent subprocesses are not read-only sandboxes; export the review request and use a read-only agent session")
     report=Path(c["output"])/"report.json"
     evidence=strict_json(report)
     request={"schema":"secbrief-automation/agent-review-v1","status":"prepared_only","approval_required":True,
@@ -306,17 +244,9 @@ def agent_plan(config_path, output, command=None):
     atomic_json(output,request)
     print(json.dumps({"status":"prepared_only","output":str(output)})); return 0
 
-def timer_text(config_path, home):
-    # Explicit JST, independent of host timezone. Quote systemd arguments, not shell.
-    def quote(value): return json.dumps(str(value).replace("%","%%").replace("$","$$"))
-    conf=Path(config_path).expanduser().resolve()
-    command=" ".join(quote(x) for x in (sys.executable,Path(__file__).resolve(),"cycle","--config",conf))
-    return {"secbrief-automation.service":"[Unit]\nDescription=Secbrief security brief cycle\n\n[Service]\nType=oneshot\nUMask=0077\nWorkingDirectory="+quote(conf.parent)+"\nExecStart="+command+"\n",
-            "secbrief-automation.timer":"[Unit]\nDescription=Run secbrief automation daily at JST midnight\n\n[Timer]\nOnCalendar=*-*-* 00:00:00 Asia/Tokyo\nPersistent=true\nUnit=secbrief-automation.service\n\n[Install]\nWantedBy=timers.target\n"}
 def main(argv=None):
     p=argparse.ArgumentParser(); sub=p.add_subparsers(dest="cmd",required=True)
     c=sub.add_parser("cycle"); c.add_argument("--config",required=True)
-    t=sub.add_parser("timer"); t.add_argument("--config",required=True); t.add_argument("--output",required=True); t.add_argument("--install",action="store_true")
     pl=sub.add_parser("plan"); pl.add_argument("--config",required=True); pl.add_argument("--name",required=True); pl.add_argument("--output",required=True)
     ap=sub.add_parser("agent-plan"); ap.add_argument("--config",required=True); ap.add_argument("--output",required=True); ap.add_argument("--agent-command",nargs=argparse.REMAINDER)
     ex=sub.add_parser("execute"); ex.add_argument("--plan",required=True); ex.add_argument("--approve",required=True)
@@ -327,16 +257,6 @@ def main(argv=None):
             data=plan_data(load_config(a.config),a.name); data["plan_hash"]=digest(data); atomic_json(a.output,data); print(data["plan_hash"]); return 0
         if a.cmd=="agent-plan": return agent_plan(a.config,a.output,a.agent_command)
         if a.cmd=="execute": return execute_plan(a.plan,a.approve)
-        files=timer_text(a.config,Path.home()); out=Path(a.output).expanduser()
-        if a.install:
-            out=Path.home()/".config/systemd/user"; out.mkdir(parents=True,exist_ok=True,mode=0o700)
-            for name,text in files.items(): (out/name).write_text(text,encoding="utf-8")
-            print(f"installed unit files in {out}; enable/start with systemctl --user")
-        else:
-            out.mkdir(parents=True,exist_ok=True)
-            for name,text in files.items(): (out/name).write_text(text,encoding="utf-8")
-            print(f"generated unit files in {out} (not installed)")
-        return 0
     except (AutomationError,OSError,subprocess.TimeoutExpired,ValueError) as e:
         print(f"error: {type(e).__name__}: {e}",file=sys.stderr); return 2
 if __name__=="__main__": sys.exit(main())

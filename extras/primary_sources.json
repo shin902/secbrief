@@ -1,0 +1,14 @@
+{
+  "sources": [
+    {"url":"https://api.github.com/repos/php/php-src/security-advisories?per_page=100","format":"json","product":"PHP","purpose":"upstream advisory ranges and patched versions"},
+    {"url":"https://api.github.com/repos/nodejs/node/security-advisories?per_page=100","format":"json","product":"Node.js","purpose":"upstream repository advisories; empty is not complete coverage"},
+    {"url":"https://raw.githubusercontent.com/nodejs/security-wg/main/vuln/core/index.json","format":"node-core-json","product":"Node.js","purpose":"official security-wg core vulnerability database"},
+    {"url":"https://nodejs.org/en/feed/blog.xml","format":"rss","product":"Node.js","purpose":"official announcements; discovery only, no version inference"},
+    {"url":"https://api.github.com/repos/electron/electron/security-advisories?per_page=100","format":"json","product":"Electron","purpose":"Electron-specific advisory ranges and patched versions"},
+    {"url":"https://releases.electronjs.org/releases.json","format":"json","product":"Electron","purpose":"release component mapping; not proof of a CVE fix"},
+    {"url":"https://api.github.com/repos/oven-sh/bun/security-advisories?per_page=100","format":"json","product":"Bun","purpose":"upstream advisory ranges and patched versions"},
+    {"url":"https://api.github.com/repos/python/cpython/security-advisories?per_page=100","format":"json","product":"CPython","purpose":"discovery only; empty listing is not complete coverage"},
+    {"url":"https://api.github.com/repos/google/brotli/security-advisories?per_page=100","format":"json","product":"Brotli","purpose":"discovery only; empty listing is not complete coverage"},
+    {"url":"https://curl.se/docs/vuln.json","format":"json","product":"curl","purpose":"official vulnerability data; source tracking"}
+  ]
+}

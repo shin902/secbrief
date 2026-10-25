@@ -14,11 +14,7 @@
     {"ecosystem": "electron", "name": "electron", "version": "32.2.0", "location": "/opt/my-app/node_modules/electron"}
   ],
   "electron_release_url": "https://releases.electronjs.org/releases.json",
-  "primary_sources": [
-    {"url": "https://api.github.com/repos/php/php-src/security-advisories/GHSA-w8hw-w9fx-j79w", "format": "json"},
-    {"url": "https://api.github.com/repos/php/php-src/security-advisories/GHSA-6wmf-4rv5-p3rp", "format": "json"},
-    {"url": "https://nodejs.org/en/feed/blog.xml", "format": "atom"},
-    {"url": "https://releases.electronjs.org/releases.json", "format": "json"}
-  ],
+  "primary_source_catalog": true,
+  "primary_sources": [],
   "reviewed_rules": []
 }

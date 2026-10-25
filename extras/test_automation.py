@@ -1,38 +1,35 @@
-import json, os, subprocess, sys, tempfile, unittest
+import contextlib, io, json, os, subprocess, sys, tempfile, unittest
 from pathlib import Path
 from unittest.mock import patch
 import automation as a
 
+
+def cycle_result(config):
+    output=io.StringIO()
+    with contextlib.redirect_stdout(output):
+        code=a.cycle(config)
+    return code,json.loads(output.getvalue())
+
+
 class AutomationTests(unittest.TestCase):
-    def test_cycle_changed_nochange_failure_and_outbox(self):
+    def test_cycle_returns_changed_nochange_and_failed_json_status(self):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d); out=root/'out'; state=root/'state'; out.mkdir()
             config=root/'config.json'; config.write_text(json.dumps({"schema":"secbrief-automation/config-v1","runner":"unused","output":str(out),"state_dir":str(state)}))
-            (out/'report.json').write_text('{}'); (out/'alerts.json').write_text('{}')
-            report={"status":"complete","change_count":1}; alerts={"changed":["finding"]}
-            with patch.object(a,"load_config",return_value=json.loads(config.read_text())), patch.object(a,"run_runner",return_value=type("P",(),{"returncode":10,"stdout":"","stderr":""})()), patch.object(a,"strict_json",side_effect=[report,alerts]):
-                self.assertEqual(a.cycle(config),0)
-            self.assertTrue((state/'outbox.jsonl').exists())
-            report={"status":"complete","change_count":0}; alerts={"changed":[]}
-            with patch.object(a,"load_config",return_value=json.loads(config.read_text())), patch.object(a,"run_runner",return_value=type("P",(),{"returncode":0,"stdout":"","stderr":""})()), patch.object(a,"strict_json",side_effect=[report,alerts]):
-                self.assertEqual(a.cycle(config),0)
-            self.assertEqual(len((state/'outbox.jsonl').read_text().splitlines()),1)
-            with patch.object(a,"load_config",return_value=json.loads(config.read_text())), patch.object(a,"run_runner",return_value=type("P",(),{"returncode":2,"stdout":"","stderr":"scan failed"})()), patch.object(a,"strict_json",side_effect=[report,alerts]):
-                self.assertEqual(a.cycle(config),2)
-            receipts=[json.loads(x) for x in (state/'receipts.jsonl').read_text().splitlines()]
-            self.assertEqual([x['status'] for x in receipts],['changed','nochange','failed'])
-
-    def test_discord_unknown_attempt_is_never_retried(self):
-        with tempfile.TemporaryDirectory() as d:
-            env="SECBrief_TEST_WEBHOOK"; os.environ[env]="https://discord.com/api/webhooks/123/secret"
-            try:
-                cfg={"webhook_env":env}
-                with patch.object(a.urllib.request,"urlopen",side_effect=TimeoutError("secret url should not escape")) as post:
-                    first=a.discord_send(cfg,"hello",d,"cycle-1")
-                    second=a.discord_send(cfg,"hello",d,"cycle-1")
-                self.assertEqual(first['status'],'unknown'); self.assertEqual(second['status'],'not_sent'); post.assert_called_once()
-                self.assertNotIn('secret',(Path(d)/[x for x in os.listdir(d) if x.startswith('discord-attempt')][0]).read_text())
-            finally: os.environ.pop(env,None)
+            (out/'report.json').write_text('{}')
+            report={"status":"complete","change_count":1}
+            with patch.object(a,"load_config",return_value=json.loads(config.read_text())), patch.object(a,"run_runner",return_value=type("P",(),{"returncode":10,"stdout":"","stderr":""})()), patch.object(a,"strict_json",return_value=report):
+                code,result=cycle_result(config)
+            self.assertEqual(code,0); self.assertEqual(result['status'],'changed')
+            report={"status":"complete","change_count":0}
+            with patch.object(a,"load_config",return_value=json.loads(config.read_text())), patch.object(a,"run_runner",return_value=type("P",(),{"returncode":0,"stdout":"","stderr":""})()), patch.object(a,"strict_json",return_value=report):
+                code,result=cycle_result(config)
+            self.assertEqual(code,0); self.assertEqual(result['status'],'nochange')
+            with patch.object(a,"load_config",return_value=json.loads(config.read_text())), patch.object(a,"run_runner",return_value=type("P",(),{"returncode":2,"stdout":"","stderr":"scan failed"})()), patch.object(a,"strict_json",return_value=report):
+                code,result=cycle_result(config)
+            self.assertEqual(code,2); self.assertEqual(result['status'],'failed')
+            self.assertFalse((state/'outbox.jsonl').exists())
+            self.assertFalse((state/'receipts.jsonl').exists())
 
     def test_plan_requires_exact_hash_and_runs_harmless_fixture(self):
         with tempfile.TemporaryDirectory() as d:
@@ -45,7 +42,6 @@ class AutomationTests(unittest.TestCase):
             with self.assertRaisesRegex(a.AutomationError,'approval denied'):
                 a.execute_plan(planfile,'')
             self.assertEqual(target.read_text(),'v1')
-            # Any edited field invalidates the exact approval hash.
             data['update'][2] += ";# tampered"; planfile.write_text(json.dumps(data))
             with self.assertRaisesRegex(a.AutomationError,'hash mismatch'):
                 a.execute_plan(planfile,data['plan_hash'])
@@ -62,34 +58,26 @@ class AutomationTests(unittest.TestCase):
             self.assertEqual(a.execute_plan(pp,plan['plan_hash']),2)
             receipt=json.loads((root/'.secbrief-remediation-receipt.json').read_text()); self.assertEqual(receipt['status'],'failed')
 
-    def test_timer_generation_default_calendar_and_no_install(self):
-        with tempfile.TemporaryDirectory() as d:
-            config=Path(d)/'config.json'; config.write_text('{}'); out=Path(d)/'units'
-            self.assertEqual(a.main(['timer','--config',str(config),'--output',str(out)]),0)
-            timer=(out/'secbrief-automation.timer').read_text()
-            self.assertIn('OnCalendar=*-*-* 00:00:00',timer); self.assertIn('Persistent=true',timer)
-            self.assertFalse((Path.home()/'.config/systemd/user/secbrief-automation.timer').exists())
 
 class IntegrationTests(unittest.TestCase):
-    def test_source_changes_notify_and_timestamp_only_does_not(self):
+    def test_source_changes_are_reported_and_timestamp_only_is_silent(self):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d); out=root/'out'; out.mkdir(); state=root/'state'
             src=root/'sources.json'; src.write_text('{}')
             cp=root/'config.json'; cp.write_text(json.dumps({'schema':'secbrief-automation/config-v1','runner':'unused','output':str(out),'state_dir':str(state),'inventory_sources_config':str(src)}))
             source={'assets':[],'errors':[],'advisories':[],'source_snapshots':[{'source_url':'https://vendor.test/feed','sha256':'one','retrieved_at':'first'}]}
             def runner(c):
-                (out/'report.json').write_text(json.dumps({'status':'inventory_only','change_count':None})); (out/'alerts.json').write_text('{}'); (out/'report.md').write_text('# test\n')
+                (out/'report.json').write_text(json.dumps({'status':'inventory_only','change_count':None})); (out/'report.md').write_text('# test\n')
                 return subprocess.CompletedProcess([],0,'','')
             with patch.object(a,'run_runner',side_effect=runner), patch('inventory_sources.collect',return_value=source):
-                self.assertEqual(a.cycle(cp),0)
+                code,result=cycle_result(cp); self.assertEqual(code,0); self.assertEqual(result['status'],'nochange')
                 source['source_snapshots'][0]['retrieved_at']='second'
-                self.assertEqual(a.cycle(cp),0)
-                self.assertFalse((state/'outbox.jsonl').exists())
+                code,result=cycle_result(cp); self.assertEqual(code,0); self.assertEqual(result['status'],'nochange')
                 source['source_snapshots'][0]['sha256']='two'
-                self.assertEqual(a.cycle(cp),0)
-                self.assertEqual(len((state/'outbox.jsonl').read_text().splitlines()),1)
+                code,result=cycle_result(cp); self.assertEqual(code,0); self.assertTrue(result['source_changed'])
+                self.assertEqual(result['status'],'changed')
                 source['errors']=['source failed']
-                self.assertEqual(a.cycle(cp),2)
+                code,result=cycle_result(cp); self.assertEqual(code,2); self.assertEqual(result['status'],'failed')
                 self.assertEqual(json.loads((state/'source-state.json').read_text())['sources'][0]['sha256'],'two')
 
     def test_restart_precedes_verification_and_approval_cannot_be_reused(self):
@@ -108,12 +96,5 @@ class IntegrationTests(unittest.TestCase):
                 self.assertEqual(a.agent_plan(cp,Path(d)/'request.json'),0)
                 with self.assertRaises(a.AutomationError): a.agent_plan(cp,Path(d)/'request.json',['malicious'])
                 run.assert_not_called()
-
-    def test_discord_readback_checks_exact_content_and_retains_id(self):
-        import io
-        with tempfile.TemporaryDirectory() as d, patch.dict(os.environ,{'TEST_WEBHOOK':'https://discord.com/api/webhooks/123/token'}):
-            with patch.object(a.urllib.request,'urlopen',side_effect=[io.BytesIO(b'{"id":"42"}'),io.BytesIO(b'{"id":"42","content":"wrong"}')]):
-                result=a.discord_send({'webhook_env':'TEST_WEBHOOK'},'expected',d,'one')
-            self.assertEqual(result,{'status':'unknown','message_id':'42'})
 
 if __name__=='__main__': unittest.main()
